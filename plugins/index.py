@@ -13,15 +13,16 @@ from utils import LINK_RE, fmt_time, get_media, should_index, temp
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-MAX_BATCH = 100
-MIN_BATCH = 20
-START_DELAY = 1.2
-MIN_DELAY = 0.8
-MAX_DELAY = 30.0
-PREFETCH = 2
-SPEED_UP_AFTER = 8
-SLOW_CALL = 8.0
+BATCH_SIZE = 100
+START_DELAY = 1.5
+MIN_DELAY = 1.0
+MAX_DELAY = 20.0
+PREFETCH = 1
+SPEED_UP_AFTER = 10
+SLOW_CALL = 12.0
 FETCH_TIMEOUT = 300
+MAX_RETRIES = 5
+UI_EDIT_INTERVAL = 10
 
 _lock = asyncio.Lock()
 
@@ -68,6 +69,7 @@ async def _start_indexing(bot, message, chat_id, last_msg_id):
         last = await bot.get_messages(chat_id, last_msg_id)
     except Exception:
         return await message.reply("Make sure I am an admin in the channel, especially if it is private.")
+
     if last.empty:
         return await message.reply("I can't read that message. Am I an admin of that chat?")
 
@@ -140,26 +142,33 @@ async def indexing_status(bot, message):
 class _Pace:
     def __init__(self):
         self.delay = START_DELAY
-        self.batch = MAX_BATCH
         self.clean = 0
         self.floods = 0
 
-    def flood(self):
+    def throttle(self):
         self.floods += 1
         self.clean = 0
-        self.delay = min(MAX_DELAY, self.delay * 2)
-        self.batch = max(MIN_BATCH, self.batch // 2)
+        self.delay = min(MAX_DELAY, max(self.delay * 1.3, START_DELAY))
 
     def success(self):
         self.clean += 1
         if self.clean >= SPEED_UP_AFTER:
             self.clean = 0
-            self.delay = max(MIN_DELAY, self.delay * 0.85)
-            self.batch = min(MAX_BATCH, self.batch + 10)
+            self.delay = max(MIN_DELAY, self.delay * 0.9)
 
 
-async def _fetch(bot, chat, ids, pace, retries=4):
-    for attempt in range(retries):
+async def _sleep(seconds):
+    end = time.monotonic() + seconds
+    while not temp.CANCEL:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        await asyncio.sleep(min(1, left))
+
+
+async def _fetch(bot, chat, ids, pace):
+    attempt = 0
+    while attempt < MAX_RETRIES:
         if temp.CANCEL:
             return None
         started = time.monotonic()
@@ -168,22 +177,24 @@ async def _fetch(bot, chat, ids, pace, retries=4):
                 bot.get_messages(chat_id=chat, message_ids=ids), timeout=FETCH_TIMEOUT
             )
         except FloodWait as e:
-            pace.flood()
-            logger.warning(f"FloodWait {e.value}s (delay {pace.delay:.1f}s, batch {pace.batch})")
-            await asyncio.sleep(e.value + 1)
+            pace.throttle()
+            logger.warning(f"FloodWait {e.value}s (delay {pace.delay:.1f}s)")
+            await _sleep(e.value + 1)
             continue
         except asyncio.TimeoutError:
-            pace.flood()
-            logger.warning(f"get_messages timed out (delay {pace.delay:.1f}s, batch {pace.batch})")
+            attempt += 1
+            pace.throttle()
+            logger.warning(f"get_messages timed out ({attempt}/{MAX_RETRIES}, delay {pace.delay:.1f}s)")
             continue
         except Exception as e:
-            logger.warning(f"get_messages failed ({attempt + 1}/{retries}): {e}")
-            await asyncio.sleep(2 * (attempt + 1))
+            attempt += 1
+            logger.warning(f"get_messages failed ({attempt}/{MAX_RETRIES}): {e}")
+            await _sleep(2 * attempt)
             continue
 
         if time.monotonic() - started >= SLOW_CALL:
-            pace.flood()
-            logger.warning(f"Telegram throttled the request (delay {pace.delay:.1f}s, batch {pace.batch})")
+            pace.throttle()
+            logger.info(f"Slow response, pacing adjusted (delay {pace.delay:.1f}s)")
         else:
             pace.success()
         return result
@@ -194,8 +205,10 @@ async def _producer(bot, chat, start, last_msg_id, queue, pace, state):
     pos = start
     try:
         while pos < last_msg_id and not temp.CANCEL:
-            await asyncio.sleep(pace.delay)
-            ids = list(range(pos + 1, min(pos + pace.batch, last_msg_id) + 1))
+            await _sleep(pace.delay)
+            if temp.CANCEL:
+                break
+            ids = list(range(pos + 1, min(pos + BATCH_SIZE, last_msg_id) + 1))
             messages = await _fetch(bot, chat, ids, pace)
             await queue.put((ids[-1], len(ids), messages))
             pos = ids[-1]
@@ -261,27 +274,29 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
         producer = asyncio.create_task(
             _producer(bot, chat, start_pos, last_msg_id, queue, pace, state)
         )
+
         try:
             while True:
                 item = await _next_item(queue)
                 if item is None:
                     break
+
                 batch_last, count, messages = item
 
                 if messages is None:
-                    if not temp.CANCEL:
-                        s["err"] += count
+                    if temp.CANCEL:
+                        break
+                    s["err"] += count
                 else:
                     await _process_batch(messages, s)
 
-                if not (messages is None and temp.CANCEL):
-                    current = batch_last
-                    temp.CURRENT = current
+                current = batch_last
+                temp.CURRENT = current
 
                 if temp.CANCEL:
                     break
 
-                if time.time() - last_edit >= 8:
+                if time.time() - last_edit >= UI_EDIT_INTERVAL:
                     last_edit = time.time()
                     done = current - start_pos
                     speed = done / max(time.time() - start, 1)
@@ -306,6 +321,7 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
             cancelled = temp.CANCEL
             if not cancelled:
                 temp.CURRENT = 0
+
             elapsed = max(time.time() - start, 1)
             title = f"⛔ <b>Indexing cancelled</b> at #{current}" if cancelled else "✅ <b>Indexing completed!</b>"
             await msg.edit_text(

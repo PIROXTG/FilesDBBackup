@@ -139,7 +139,6 @@ async def indexing_status(bot, message):
 
 
 class _Pace:
-    """Adaptive delay between fetches: speeds up when clean, backs off on FloodWait."""
 
     def __init__(self):
         self.delay = MIN_DELAY
@@ -179,7 +178,6 @@ async def _fetch(bot, chat, ids, pace, retries=4):
 
 
 async def _producer(bot, chat, start, last_msg_id, queue, pace, state):
-    """Fetches batches ahead of the saver so network and database work overlap."""
     pos = start
     try:
         while pos < last_msg_id and not temp.CANCEL:

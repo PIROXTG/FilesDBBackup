@@ -60,6 +60,12 @@ class Job:
         self.dropped = list(data.get("dropped", []))
         self.status = data.get("status", "stopped")
         self.error = data.get("error")
+        self.start_shard = data.get("start_shard", data["shard"])
+        self.start_id = data.get("start_id")
+        self.ends = dict(data.get("ends", {}))
+        self.failed = list(data.get("failed", []))
+        self.deleted = data.get("deleted", 0)
+        self.cleanup_error = None
         self.stop = False
         self.turn = 0
         self.pending = 0
@@ -90,6 +96,11 @@ class Job:
             "dropped": self.dropped,
             "status": status,
             "error": self.error,
+            "start_shard": self.start_shard,
+            "start_id": self.start_id,
+            "ends": self.ends,
+            "failed": self.failed,
+            "deleted": self.deleted,
         }
 
 
@@ -137,6 +148,10 @@ def _status_text(job: Job, label: str, live: bool = False) -> str:
             f"├ Elapsed: <code>{fmt_time(elapsed)}</code>",
             f"└ ETA: <code>{eta}</code>",
         ]
+    if job.deleted:
+        lines.append(f"\n🧹 Removed from database: <code>{job.deleted}</code>")
+    if job.cleanup_error:
+        lines.append(f"\n⚠️ Cleanup problem: {html.escape(job.cleanup_error)}")
     if job.dropped:
         ids = ", ".join(f"<code>{c}</code>" for c in job.dropped)
         lines.append(f"\n⚠️ Removed channels: {ids}")
@@ -210,6 +225,7 @@ async def _send(client, job: Job, doc: dict) -> bool:
             job.dropped.append(channel)
             continue
         job.errors += 1
+        job.failed.append(doc["_id"])
         job.turn += 1
         return True
     return False
@@ -243,10 +259,35 @@ async def _process(client, job: Job):
                 next_at = slot + config.FORWARD_INTERVAL / max(len(job.channels), 1)
 
             job.last_id = doc["_id"]
+            job.ends[str(job.shard)] = job.last_id
             job.pending += 1
             if job.pending >= config.FORWARD_SAVE_EVERY:
                 job.pending = 0
                 await _save(job, "running")
+
+
+async def _cleanup(job: Job):
+    removed, problems = 0, []
+    for shard in filedb.shards:
+        end = job.ends.get(str(shard.number))
+        if shard.number < job.start_shard or end is None:
+            continue
+        span = {"$lte": end}
+        if shard.number == job.start_shard and job.start_id is not None:
+            span["$gt"] = job.start_id
+        if job.failed:
+            span["$nin"] = job.failed
+        try:
+            result = await shard.col.delete_many({"_id": span})
+            removed += result.deleted_count
+            await filedb._refresh(shard, force=True)
+        except Exception as e:
+            logger.error(f"DB {shard.number}: cleanup failed: {e}")
+            problems.append(f"DB {shard.number}: {type(e).__name__}")
+    job.deleted += removed
+    if problems:
+        job.cleanup_error = ", ".join(problems)
+    logger.info(f"Cleanup finished, {removed} files removed")
 
 
 async def _status_loop(job: Job):
@@ -276,6 +317,9 @@ async def _run(client, job: Job):
         status, job.error = "failed", str(e)
     finally:
         ticker.cancel()
+
+    if status == "done":
+        await _cleanup(job)
 
     await _save(job, status)
     label = {"done": "✅ Completed", "stopped": "🛑 Stopped", "failed": "❌ Failed"}[status]
@@ -324,6 +368,8 @@ async def _new_job_data(args: list) -> dict:
         "channels": channels,
         "shard": shard,
         "last_id": last_id,
+        "start_shard": shard,
+        "start_id": last_id,
         "skip": skip,
         "sent": 0,
         "errors": 0,
@@ -336,6 +382,8 @@ async def _resume_job_data() -> dict:
     data = await forward_db.get()
     if not data or data.get("status") == "done" or not data.get("channels"):
         raise ValueError("No saved job to resume.")
+    if "start_shard" not in data:
+        data["start_shard"], data["start_id"] = await filedb.skip_cursor(data.get("skip", 0))
     return data
 
 

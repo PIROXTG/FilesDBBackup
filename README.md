@@ -1,9 +1,11 @@
-# 📁 FileSaverBot
+# 📁 FilesDBBackup
 
 A Telegram bot by **PiRO** that indexes files from your channels into MongoDB, lets users search them, and can forward the whole collection to any channels you choose.
 
 [![Updates](https://img.shields.io/badge/Updates-@piroxbots-blue?logo=telegram)](https://t.me/piroxbots)
 [![Support](https://img.shields.io/badge/Support-@piroxsupportbot-blue?logo=telegram)](https://t.me/piroxsupportbot)
+[![Stars](https://img.shields.io/github/stars/PIROXTG/FilesDBBackup?style=social)](https://github.com/PIROXTG/FilesDBBackup/stargazers)
+[![Forks](https://img.shields.io/github/forks/PIROXTG/FilesDBBackup?style=social)](https://github.com/PIROXTG/FilesDBBackup/fork)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## ✨ Features
@@ -36,8 +38,8 @@ A Telegram bot by **PiRO** that indexes files from your channels into MongoDB, l
 **Requirements:** Python 3.10+ (3.11 recommended) and at least one MongoDB URI (a free Atlas cluster works).
 
 ```bash
-git clone https://github.com/<your-username>/FileSaverBot
-cd FileSaverBot
+git clone https://github.com/PIROXTG/FilesDBBackup
+cd FilesDBBackup
 pip install -r requirements.txt
 cp .env.example .env
 python bot.py
@@ -59,8 +61,8 @@ Never commit your `.env` file. It is already in `.gitignore`.
 ### Docker
 
 ```bash
-docker build -t filesaverbot .
-docker run -d --env-file .env filesaverbot
+docker build -t filesdbbackup .
+docker run -d --env-file .env filesdbbackup
 ```
 
 ### Heroku and similar platforms
@@ -91,7 +93,7 @@ A `Procfile` is included. Set the variables above in your platform's config and 
 
 ## ⭐ Support the project
 
-If this bot helps you, please **star** ⭐ and **fork** 🍴 the repository. It helps others find it and keeps the project going.
+If this bot helps you, please [**star** ⭐](https://github.com/PIROXTG/FilesDBBackup) and [**fork** 🍴](https://github.com/PIROXTG/FilesDBBackup/fork) the repository. It helps others find it and keeps the project going.
 
 ## 📜 License
 

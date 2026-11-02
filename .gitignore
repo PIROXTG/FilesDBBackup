@@ -1,0 +1,11 @@
+.env
+sessions/
+logs/
+restart.json
+blacklist.txt
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+.venv/
+venv/

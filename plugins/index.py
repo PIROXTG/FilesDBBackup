@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 BATCH_SIZE = 50
-START_DELAY = 1.5
+START_DELAY = 3.0
 MIN_DELAY = 1.0
-MAX_DELAY = 20.0
+MAX_DELAY = 60.0
 PREFETCH = 1
-SPEED_UP_AFTER = 10
-SLOW_CALL = 12.0
+SPEED_UP_AFTER = 6
+SLOW_CALL = 3.0
+PENALTY_FACTOR = 0.6
+RELAX_FACTOR = 0.93
 FETCH_TIMEOUT = 300
 MAX_RETRIES = 5
 UI_EDIT_INTERVAL = 10
@@ -145,16 +147,16 @@ class _Pace:
         self.clean = 0
         self.floods = 0
 
-    def throttle(self):
+    def throttle(self, waited: float = 0.0):
         self.floods += 1
         self.clean = 0
-        self.delay = min(MAX_DELAY, max(self.delay * 1.3, START_DELAY))
+        self.delay = min(MAX_DELAY, self.delay + max(waited * PENALTY_FACTOR, 1.0))
 
     def success(self):
         self.clean += 1
         if self.clean >= SPEED_UP_AFTER:
             self.clean = 0
-            self.delay = max(MIN_DELAY, self.delay * 0.9)
+            self.delay = max(MIN_DELAY, self.delay * RELAX_FACTOR)
 
 
 async def _sleep(seconds):
@@ -177,14 +179,14 @@ async def _fetch(bot, chat, ids, pace):
                 bot.get_messages(chat_id=chat, message_ids=ids), timeout=FETCH_TIMEOUT
             )
         except FloodWait as e:
-            pace.throttle()
-            logger.warning(f"FloodWait {e.value}s (delay {pace.delay:.1f}s)")
+            pace.throttle(e.value)
+            logger.warning(f"FloodWait {e.value}s (interval {pace.delay:.1f}s)")
             await _sleep(e.value + 1)
             continue
         except asyncio.TimeoutError:
             attempt += 1
-            pace.throttle()
-            logger.warning(f"get_messages timed out ({attempt}/{MAX_RETRIES}, delay {pace.delay:.1f}s)")
+            pace.throttle(FETCH_TIMEOUT / 10)
+            logger.warning(f"get_messages timed out ({attempt}/{MAX_RETRIES}, interval {pace.delay:.1f}s)")
             continue
         except Exception as e:
             attempt += 1
@@ -192,9 +194,10 @@ async def _fetch(bot, chat, ids, pace):
             await _sleep(2 * attempt)
             continue
 
-        if time.monotonic() - started >= SLOW_CALL:
-            pace.throttle()
-            logger.info(f"Slow response, pacing adjusted (delay {pace.delay:.1f}s)")
+        elapsed = time.monotonic() - started
+        if elapsed >= SLOW_CALL:
+            pace.throttle(elapsed - SLOW_CALL / 2)
+            logger.info(f"Server-side wait {elapsed:.1f}s, interval now {pace.delay:.1f}s")
         else:
             pace.success()
         return result

@@ -13,7 +13,7 @@ from utils import LINK_RE, fmt_time, get_media, should_index, temp
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-BATCH_SIZE = 100
+BATCH_SIZE = 50
 START_DELAY = 1.5
 MIN_DELAY = 1.0
 MAX_DELAY = 20.0

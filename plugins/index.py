@@ -21,10 +21,6 @@ CANCEL_MARKUP = InlineKeyboardMarkup(
 
 
 def _forward_info(message):
-    chat = getattr(message, "forward_from_chat", None)
-    msg_id = getattr(message, "forward_from_message_id", None)
-    if chat and msg_id:
-        return chat, msg_id
     origin = getattr(message, "forward_origin", None)
     if origin:
         chat = getattr(origin, "chat", None)
@@ -90,7 +86,7 @@ async def index_command(bot, message):
 )
 async def index_from_link_or_forward(bot, message):
     chat_id = last_id = None
-    if message.text and not message.forward_date:
+    if message.text and not message.forward_origin:
         chat_id, last_id = _parse_link(message.text)
         if not chat_id:
             return await message.reply("Invalid link.")

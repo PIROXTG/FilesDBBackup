@@ -13,6 +13,12 @@ from utils import LINK_RE, fmt_time, get_media, should_index, temp
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+BATCH_SIZE = 100
+MIN_DELAY = 0.35
+MAX_DELAY = 6.0
+PREFETCH = 3
+SPEED_UP_AFTER = 8
+
 _lock = asyncio.Lock()
 
 CANCEL_MARKUP = InlineKeyboardMarkup(
@@ -21,6 +27,10 @@ CANCEL_MARKUP = InlineKeyboardMarkup(
 
 
 def _forward_info(message):
+    chat = getattr(message, "forward_from_chat", None)
+    msg_id = getattr(message, "forward_from_message_id", None)
+    if chat and msg_id:
+        return chat, msg_id
     origin = getattr(message, "forward_origin", None)
     if origin:
         chat = getattr(origin, "chat", None)
@@ -84,9 +94,11 @@ async def index_command(bot, message):
     & filters.user(config.ADMINS)
     & (filters.forwarded | (filters.text & filters.regex(LINK_RE.pattern)))
 )
+
+
 async def index_from_link_or_forward(bot, message):
     chat_id = last_id = None
-    if message.text and not message.forward_origin:
+    if message.text and not message.forward_date:
         chat_id, last_id = _parse_link(message.text)
         if not chat_id:
             return await message.reply("Invalid link.")
@@ -126,17 +138,93 @@ async def indexing_status(bot, message):
         await message.reply(f"✅ No indexing running.\n📍 Next start position: {temp.CURRENT}")
 
 
-async def _fetch(bot, chat, ids, retries=3):
+class _Pace:
+    """Adaptive delay between fetches: speeds up when clean, backs off on FloodWait."""
+
+    def __init__(self):
+        self.delay = MIN_DELAY
+        self.clean = 0
+        self.floods = 0
+
+    def flood(self):
+        self.floods += 1
+        self.clean = 0
+        self.delay = min(MAX_DELAY, max(self.delay * 1.6, 0.8))
+
+    def success(self):
+        self.clean += 1
+        if self.clean >= SPEED_UP_AFTER:
+            self.clean = 0
+            self.delay = max(MIN_DELAY, self.delay * 0.85)
+
+
+async def _fetch(bot, chat, ids, pace, retries=4):
     for attempt in range(retries):
+        if temp.CANCEL:
+            return None
         try:
-            return await asyncio.wait_for(bot.get_messages(chat_id=chat, message_ids=ids), timeout=45)
+            result = await asyncio.wait_for(
+                bot.get_messages(chat_id=chat, message_ids=ids), timeout=60
+            )
+            pace.success()
+            return result
         except FloodWait as e:
-            logger.warning(f"FloodWait {e.value}s while indexing")
+            pace.flood()
+            logger.warning(f"FloodWait {e.value}s while indexing (delay now {pace.delay:.2f}s)")
             await asyncio.sleep(e.value + 1)
         except Exception as e:
             logger.warning(f"get_messages failed ({attempt + 1}/{retries}): {e}")
-            await asyncio.sleep(3 * (attempt + 1))
+            await asyncio.sleep(2 * (attempt + 1))
     return None
+
+
+async def _producer(bot, chat, start, last_msg_id, queue, pace, state):
+    """Fetches batches ahead of the saver so network and database work overlap."""
+    pos = start
+    try:
+        while pos < last_msg_id and not temp.CANCEL:
+            ids = list(range(pos + 1, min(pos + BATCH_SIZE, last_msg_id) + 1))
+            messages = await _fetch(bot, chat, ids, pace)
+            await queue.put((ids[-1], len(ids), messages))
+            pos = ids[-1]
+            await asyncio.sleep(pace.delay)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        state["error"] = e
+    await queue.put(None)
+
+
+async def _process_batch(messages, s):
+    tasks = []
+    for m in messages:
+        if not m or m.empty:
+            s["deleted"] += 1
+        elif not m.media:
+            s["no_media"] += 1
+        else:
+            media = get_media(m)
+            if media is None:
+                s["skipped"] += 1
+                continue
+            media.caption = m.caption
+            if should_index(media):
+                tasks.append(filedb.save_file(media))
+            else:
+                s["skipped"] += 1
+
+    if tasks:
+        for res in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(res, Exception):
+                s["err"] += 1
+            else:
+                saved, status = res
+                if saved:
+                    s["saved"] += 1
+                elif status == 0:
+                    s["dup"] += 1
+                else:
+                    s["err"] += 1
 
 
 async def index_files_to_db(last_msg_id, chat, msg, bot):
@@ -146,62 +234,43 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
     async with _lock:
         temp.INDEXING = True
         temp.CANCEL = False
-        current = temp.CURRENT
-        start_pos = current
+        current = start_pos = temp.CURRENT
+        pace = _Pace()
+        state = {}
+        queue = asyncio.Queue(maxsize=PREFETCH)
+        producer = asyncio.create_task(
+            _producer(bot, chat, start_pos, last_msg_id, queue, pace, state)
+        )
         try:
-            while current < last_msg_id and not temp.CANCEL:
-                ids = list(range(current + 1, min(current + config.INDEX_BATCH_SIZE, last_msg_id) + 1))
-                messages = await _fetch(bot, chat, ids)
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                batch_last, count, messages = item
+
                 if messages is None:
-                    s["err"] += len(ids)
-                    current += len(ids)
+                    if not temp.CANCEL:
+                        s["err"] += count
+                else:
+                    await _process_batch(messages, s)
+
+                if not (messages is None and temp.CANCEL):
+                    current = batch_last
                     temp.CURRENT = current
-                    continue
 
-                tasks = []
-                for m in messages:
-                    if not m or m.empty:
-                        s["deleted"] += 1
-                    elif not m.media:
-                        s["no_media"] += 1
-                    else:
-                        media = get_media(m)
-                        if media is None:
-                            s["skipped"] += 1
-                            continue
-                        media.caption = m.caption
-                        if should_index(media):
-                            tasks.append(filedb.save_file(media))
-                        else:
-                            s["skipped"] += 1
-
-                if tasks:
-                    for res in await asyncio.gather(*tasks, return_exceptions=True):
-                        if isinstance(res, Exception):
-                            s["err"] += 1
-                        else:
-                            saved, status = res
-                            if saved:
-                                s["saved"] += 1
-                            elif status == 0:
-                                s["dup"] += 1
-                            else:
-                                s["err"] += 1
-
-                current += len(ids)
-                temp.CURRENT = current
+                if temp.CANCEL:
+                    break
 
                 if time.time() - last_edit >= 8:
                     last_edit = time.time()
                     done = current - start_pos
-                    elapsed = max(time.time() - start, 1)
-                    speed = done / elapsed
+                    speed = done / max(time.time() - start, 1)
                     eta = (last_msg_id - current) / speed if speed else 0
                     try:
                         await msg.edit_text(
                             f"📊 <b>Indexing...</b> {current}/{last_msg_id} "
                             f"({current / last_msg_id * 100:.1f}%)\n"
-                            f"⚡ {speed:.1f} msg/s | 🕒 ETA {fmt_time(eta)}\n\n"
+                            f"⚡ {speed:.0f} msg/s | 🕒 ETA {fmt_time(eta)}\n\n"
                             f"📥 Saved: {s['saved']} | 🔁 Duplicate: {s['dup']}\n"
                             f"⏭ Skipped: {s['skipped']} | 🗑 Deleted: {s['deleted']} | ⚠️ Errors: {s['err']}",
                             reply_markup=CANCEL_MARKUP,
@@ -211,25 +280,29 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
                     except Exception:
                         pass
 
-                await asyncio.sleep(config.INDEX_DELAY)
+            if state.get("error"):
+                raise state["error"]
 
             cancelled = temp.CANCEL
             if not cancelled:
-                temp.CURRENT = 0  # finished: next /index starts fresh
+                temp.CURRENT = 0
+            elapsed = max(time.time() - start, 1)
             title = f"⛔ <b>Indexing cancelled</b> at #{current}" if cancelled else "✅ <b>Indexing completed!</b>"
             await msg.edit_text(
                 f"{title}\n\n"
-                f"⏱ Time: {fmt_time(time.time() - start)}\n"
+                f"⏱ Time: {fmt_time(elapsed)} ({(current - start_pos) / elapsed:.0f} msg/s)\n"
                 f"📥 Saved: {s['saved']}\n🔁 Duplicate: {s['dup']}\n"
                 f"⏭ Skipped (filtered): {s['skipped']}\n📭 Non-media: {s['no_media']}\n"
-                f"🗑 Deleted: {s['deleted']}\n⚠️ Errors: {s['err']}"
+                f"🗑 Deleted: {s['deleted']}\n⚠️ Errors: {s['err']}\n"
+                f"🌊 FloodWaits hit: {pace.floods}"
             )
         except Exception as e:
             logger.exception("Indexing failed")
             try:
-                await msg.edit_text(f"❌ Indexing failed: {str(e)[:200]}")
+                await msg.edit_text(f"❌ Indexing failed at #{current}: {str(e)[:200]}")
             except Exception:
                 pass
         finally:
+            producer.cancel()
             temp.INDEXING = False
             temp.CANCEL = False

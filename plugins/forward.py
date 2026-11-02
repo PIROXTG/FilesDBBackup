@@ -25,7 +25,6 @@ from utils import fmt_time
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-BLACKLIST_FILE = "blacklist.txt"
 BATCH_SIZE = 50
 FETCH_RETRIES = 5
 FLOOD_RETRIES = 5
@@ -97,14 +96,23 @@ class Job:
 current = None
 
 
+def _blacklist_words() -> list:
+    words = list(config.BLACKLIST_KEYWORDS)
+    if os.path.exists(config.BLACKLIST_FILE):
+        with open(config.BLACKLIST_FILE, "r", encoding="utf-8") as f:
+            words += [line.strip() for line in f if line.strip()]
+    unique = {}
+    for word in words:
+        unique.setdefault(word.lower(), word)
+    return sorted(unique.values(), key=len, reverse=True)
+
+
 def _load_blacklist():
-    if not os.path.exists(BLACKLIST_FILE):
-        return None
-    with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
-        words = [line.strip() for line in f if line.strip()]
+    words = _blacklist_words()
     if not words:
         return None
-    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.IGNORECASE)
+    pattern = "|".join(re.escape(w) for w in words)
+    return re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE)
 
 
 def _status_text(job: Job, label: str, live: bool = False) -> str:

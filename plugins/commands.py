@@ -42,6 +42,8 @@ def _start_markup():
         links.append(Btn("👤 Support", url=config.SUPPORT_LINK))
     if links:
         rows.append(links)
+    if config.REPO_LINK:
+        rows.append([Btn("⭐ Source Code", url=config.REPO_LINK)])
     return Markup(rows)
 
 

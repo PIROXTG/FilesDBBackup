@@ -66,3 +66,4 @@ FORWARD_STATUS_INTERVAL = 30
 
 SUPPORT_LINK = "https://t.me/piroxsupportbot"
 UPDATES_LINK = "https://t.me/piroxbots"
+REPO_LINK = "https://github.com/PIROXTG/FilesDBBackup"

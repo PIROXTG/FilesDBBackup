@@ -1,0 +1,6 @@
+kurigram==2.2.25
+tgcrypto==1.2.5
+motor
+pymongo
+dnspython
+python-dotenv

@@ -20,6 +20,16 @@ def _items(name: str, cast=str, required: bool = False) -> list:
     return values
 
 
+def _words(name: str) -> list:
+    seen, words = set(), []
+    for value in re.split(r"[,\n]", os.getenv(name, "")):
+        word = value.strip()
+        if word and word.lower() not in seen:
+            seen.add(word.lower())
+            words.append(word)
+    return words
+
+
 API_ID = int(_required("API_ID"))
 API_HASH = _required("API_HASH")
 BOT_TOKEN = _required("BOT_TOKEN")
@@ -59,6 +69,9 @@ MAX_RESULTS = 200
 MIN_QUERY_LENGTH = 2
 PROTECT_CONTENT = False
 AUTO_DELETE_SECONDS = 0
+
+BLACKLIST_KEYWORDS = _words("BLACKLIST_KEYWORDS")
+BLACKLIST_FILE = "blacklist.txt"
 
 FORWARD_INTERVAL = 3.0
 FORWARD_SAVE_EVERY = 20

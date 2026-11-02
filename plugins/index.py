@@ -13,11 +13,15 @@ from utils import LINK_RE, fmt_time, get_media, should_index, temp
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-BATCH_SIZE = 100
-MIN_DELAY = 0.35
-MAX_DELAY = 6.0
-PREFETCH = 3
+MAX_BATCH = 100
+MIN_BATCH = 20
+START_DELAY = 1.2
+MIN_DELAY = 0.8
+MAX_DELAY = 30.0
+PREFETCH = 2
 SPEED_UP_AFTER = 8
+SLOW_CALL = 8.0
+FETCH_TIMEOUT = 300
 
 _lock = asyncio.Lock()
 
@@ -27,17 +31,13 @@ CANCEL_MARKUP = InlineKeyboardMarkup(
 
 
 def _forward_info(message):
-    chat = getattr(message, "forward_from_chat", None)
-    msg_id = getattr(message, "forward_from_message_id", None)
-    if chat and msg_id:
-        return chat, msg_id
     origin = getattr(message, "forward_origin", None)
     if origin:
-        chat = getattr(origin, "chat", None)
-        msg_id = getattr(origin, "message_id", None)
-        if chat and msg_id:
-            return chat, msg_id
-    return None, None
+        return getattr(origin, "chat", None), getattr(origin, "message_id", None)
+    return (
+        getattr(message, "forward_from_chat", None),
+        getattr(message, "forward_from_message_id", None),
+    )
 
 
 def _parse_link(text: str):
@@ -94,17 +94,16 @@ async def index_command(bot, message):
     & filters.user(config.ADMINS)
     & (filters.forwarded | (filters.text & filters.regex(LINK_RE.pattern)))
 )
-
-
 async def index_from_link_or_forward(bot, message):
-    chat_id = last_id = None
-    if message.text and not message.forward_date:
+    if message.text and getattr(message, "forward_origin", None) is None:
         chat_id, last_id = _parse_link(message.text)
         if not chat_id:
             return await message.reply("Invalid link.")
     else:
         chat, last_id = _forward_info(message)
-        if chat is None or getattr(chat, "type", None) != enums.ChatType.CHANNEL:
+        if chat is None or last_id is None:
+            return
+        if getattr(chat, "type", None) != enums.ChatType.CHANNEL:
             return
         chat_id = chat.username or chat.id
     await _start_indexing(bot, message, chat_id, last_id)
@@ -139,41 +138,55 @@ async def indexing_status(bot, message):
 
 
 class _Pace:
-
     def __init__(self):
-        self.delay = MIN_DELAY
+        self.delay = START_DELAY
+        self.batch = MAX_BATCH
         self.clean = 0
         self.floods = 0
 
     def flood(self):
         self.floods += 1
         self.clean = 0
-        self.delay = min(MAX_DELAY, max(self.delay * 1.6, 0.8))
+        self.delay = min(MAX_DELAY, self.delay * 2)
+        self.batch = max(MIN_BATCH, self.batch // 2)
 
     def success(self):
         self.clean += 1
         if self.clean >= SPEED_UP_AFTER:
             self.clean = 0
             self.delay = max(MIN_DELAY, self.delay * 0.85)
+            self.batch = min(MAX_BATCH, self.batch + 10)
 
 
 async def _fetch(bot, chat, ids, pace, retries=4):
     for attempt in range(retries):
         if temp.CANCEL:
             return None
+        started = time.monotonic()
         try:
             result = await asyncio.wait_for(
-                bot.get_messages(chat_id=chat, message_ids=ids), timeout=60
+                bot.get_messages(chat_id=chat, message_ids=ids), timeout=FETCH_TIMEOUT
             )
-            pace.success()
-            return result
         except FloodWait as e:
             pace.flood()
-            logger.warning(f"FloodWait {e.value}s while indexing (delay now {pace.delay:.2f}s)")
+            logger.warning(f"FloodWait {e.value}s (delay {pace.delay:.1f}s, batch {pace.batch})")
             await asyncio.sleep(e.value + 1)
+            continue
+        except asyncio.TimeoutError:
+            pace.flood()
+            logger.warning(f"get_messages timed out (delay {pace.delay:.1f}s, batch {pace.batch})")
+            continue
         except Exception as e:
             logger.warning(f"get_messages failed ({attempt + 1}/{retries}): {e}")
             await asyncio.sleep(2 * (attempt + 1))
+            continue
+
+        if time.monotonic() - started >= SLOW_CALL:
+            pace.flood()
+            logger.warning(f"Telegram throttled the request (delay {pace.delay:.1f}s, batch {pace.batch})")
+        else:
+            pace.success()
+        return result
     return None
 
 
@@ -181,16 +194,25 @@ async def _producer(bot, chat, start, last_msg_id, queue, pace, state):
     pos = start
     try:
         while pos < last_msg_id and not temp.CANCEL:
-            ids = list(range(pos + 1, min(pos + BATCH_SIZE, last_msg_id) + 1))
+            await asyncio.sleep(pace.delay)
+            ids = list(range(pos + 1, min(pos + pace.batch, last_msg_id) + 1))
             messages = await _fetch(bot, chat, ids, pace)
             await queue.put((ids[-1], len(ids), messages))
             pos = ids[-1]
-            await asyncio.sleep(pace.delay)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         state["error"] = e
     await queue.put(None)
+
+
+async def _next_item(queue):
+    while not temp.CANCEL:
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=1)
+        except asyncio.TimeoutError:
+            continue
+    return None
 
 
 async def _process_batch(messages, s):
@@ -241,7 +263,7 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
         )
         try:
             while True:
-                item = await queue.get()
+                item = await _next_item(queue)
                 if item is None:
                     break
                 batch_last, count, messages = item
@@ -292,7 +314,7 @@ async def index_files_to_db(last_msg_id, chat, msg, bot):
                 f"📥 Saved: {s['saved']}\n🔁 Duplicate: {s['dup']}\n"
                 f"⏭ Skipped (filtered): {s['skipped']}\n📭 Non-media: {s['no_media']}\n"
                 f"🗑 Deleted: {s['deleted']}\n⚠️ Errors: {s['err']}\n"
-                f"🌊 FloodWaits hit: {pace.floods}"
+                f"🌊 Throttles hit: {pace.floods}"
             )
         except Exception as e:
             logger.exception("Indexing failed")
